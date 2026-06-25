@@ -1,0 +1,8 @@
+# Rust
+/target
+
+# Test / scratch audio
+*.mp3
+
+# OS
+.DS_Store
