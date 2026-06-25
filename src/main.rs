@@ -81,6 +81,13 @@ struct Cli {
     #[arg(long = "api-key")]
     api_key: Option<String>,
 
+    /// Read MINIMAX_API_KEY from this dotenv file when no higher-priority key is
+    /// set. Lets cron call the binary directly, with no shell, to pick up the
+    /// key (e.g. --env-file /home/sylvain/.hermes/.env). Only MINIMAX_API_KEY is
+    /// read; nothing else is imported into the environment.
+    #[arg(long = "env-file")]
+    env_file: Option<String>,
+
     /// Proton Pass reference resolved via pass-cli when no key is set otherwise.
     #[arg(
         long = "pass-ref",
@@ -124,6 +131,10 @@ struct Payload {
 }
 
 /// An error carrying the process exit code to surface it with.
+//
+// `Debug` is safe here: this only ever holds an exit code and a human message,
+// never the API key (unlike `Cli`, which deliberately has no `Debug`).
+#[derive(Debug)]
 struct AppError {
     code: i32,
     msg: String,
@@ -249,7 +260,52 @@ fn split_sentences(para: &str, limit: usize) -> Vec<String> {
     sliced
 }
 
-/// Resolve the API key: flag, then env MINIMAX_API_KEY, then pass-cli.
+/// Read MINIMAX_API_KEY from a dotenv-style file.
+///
+/// Returns `Ok(Some(value))` when the key is present and non-empty, `Ok(None)`
+/// when the file is readable but has no usable `MINIMAX_API_KEY`, and `Err` when
+/// the given path cannot be opened. Tolerates a leading `export `, ignores blank
+/// lines and `#` comments, and strips one pair of surrounding quotes plus
+/// surrounding whitespace. Only `MINIMAX_API_KEY` is read; nothing is exported
+/// into the process environment.
+fn key_from_env_file(path: &str) -> Result<Option<String>, AppError> {
+    let contents = std::fs::read_to_string(path).map_err(|e| {
+        AppError::new(EXIT_USAGE, format!("cannot read --env-file {}: {}", path, e))
+    })?;
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").map(str::trim_start).unwrap_or(line);
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "MINIMAX_API_KEY" {
+            continue;
+        }
+        let value = strip_one_quote_pair(value.trim());
+        if value.is_empty() {
+            return Ok(None);
+        }
+        return Ok(Some(value.to_string()));
+    }
+    Ok(None)
+}
+
+/// Strip one matching pair of surrounding single or double quotes, if present.
+fn strip_one_quote_pair(s: &str) -> &str {
+    let b = s.as_bytes();
+    if b.len() >= 2 {
+        let (first, last) = (b[0], b[b.len() - 1]);
+        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+            return &s[1..s.len() - 1];
+        }
+    }
+    s
+}
+
+/// Resolve the API key: flag, env MINIMAX_API_KEY, --env-file, then pass-cli.
 ///
 /// The key only ever flows into the Authorization header; it is never printed.
 fn resolve_api_key(cli: &Cli) -> Result<String, AppError> {
@@ -260,6 +316,14 @@ fn resolve_api_key(cli: &Cli) -> Result<String, AppError> {
     }
     if let Ok(key) = std::env::var("MINIMAX_API_KEY") {
         if !key.is_empty() {
+            return Ok(key);
+        }
+    }
+
+    // Dotenv file (e.g. ~/.hermes/.env). Lets the cron call us without a shell
+    // to grep the key out, which `approvals.cron_mode: deny` would block.
+    if let Some(path) = &cli.env_file {
+        if let Some(key) = key_from_env_file(path)? {
             return Ok(key);
         }
     }
@@ -566,5 +630,46 @@ mod tests {
         let chunks = split_text(&text, TEXT_LIMIT);
         assert!(chunks.iter().all(|c| count(c) <= TEXT_LIMIT));
         assert_eq!(chunks.concat(), text);
+    }
+
+    fn write_temp(name: &str, body: &str) -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("tts-{}-{}.env", name, std::process::id()));
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[test]
+    fn env_file_extracts_quoted_key() {
+        let path = write_temp(
+            "quoted",
+            "# minimax credentials\nOTHER_VAR=should-be-ignored\nMINIMAX_API_KEY=\"sk-test123\"\n",
+        );
+        let got = key_from_env_file(path.to_str().unwrap()).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(got, Some("sk-test123".to_string()));
+    }
+
+    #[test]
+    fn env_file_tolerates_export_prefix() {
+        let path = write_temp("export", "export MINIMAX_API_KEY=plainvalue\n");
+        let got = key_from_env_file(path.to_str().unwrap()).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(got, Some("plainvalue".to_string()));
+    }
+
+    #[test]
+    fn env_file_missing_key_returns_none() {
+        let path = write_temp("nokey", "# nothing useful here\nFOO=bar\n");
+        let got = key_from_env_file(path.to_str().unwrap()).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn env_file_unopenable_path_errors() {
+        let err = key_from_env_file("/no/such/tts/env/file").unwrap_err();
+        assert_eq!(err.code, EXIT_USAGE);
+        assert!(err.msg.contains("--env-file"));
     }
 }

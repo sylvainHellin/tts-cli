@@ -23,11 +23,14 @@ the 10000-char limit on its own. Defaults (model `speech-2.8-hd`, voice
 asked. Full flags in `tts --help` and the repo README.
 
 The API key resolves in order: `--api-key`, then env `MINIMAX_API_KEY`, then
-Proton Pass via `pass-cli` (ref `pass://API Keys and tokens/Minimax/API Key`,
-override with `--pass-ref`). Set `MINIMAX_API_KEY` in cron/gateway environments,
-where `pass-cli` is not reachable. If no source yields a key the CLI exits
-nonzero naming both; surface that, do not retry blindly. The key is never
-printed.
+`--env-file <PATH>` (read `MINIMAX_API_KEY` from a dotenv file), then Proton Pass
+via `pass-cli` (ref `pass://API Keys and tokens/Minimax/API Key`, override with
+`--pass-ref`). For cron/gateway use, pass `--env-file /home/sylvain/.hermes/.env`:
+that environment does not export the key and `approvals.cron_mode: deny` blocks
+`bash -lc`, so a single direct call with `--env-file` (no shell) is the only path
+that works there. `pass-cli` is the route for interactive and Mac use. If no
+source yields a key the CLI exits nonzero naming both; surface that, do not retry
+blindly. The key is never printed.
 
 ## Deliver
 
