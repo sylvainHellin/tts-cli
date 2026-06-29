@@ -64,10 +64,10 @@ struct Cli {
     #[arg(long = "sample-rate", default_value_t = 32000)]
     sample_rate: i64,
 
-    // 32 kbps mono keeps files small: fast Signal/email voice notes, and long
-    // narration saved into the Obsidian vault stays under the ~5 MB per-file ceiling
-    // Obsidian Sync needs to propagate attachments to the phone. Raise for higher fidelity.
-    #[arg(long, default_value_t = 32000)]
+    // Default 64 kbps mono: a good speech/size balance at half of 128 kbps. Pick the
+    // bitrate that maximizes quality within the delivery channel's per-file ceiling
+    // (Obsidian Sync ~5 MB, email 25 MB); for long vault audio over 5 MB, lower it or split.
+    #[arg(long, default_value_t = 64000)]
     bitrate: i64,
 
     #[arg(long, default_value = "mp3")]
@@ -552,7 +552,7 @@ mod tests {
             },
             "audio_setting": {
                 "sample_rate": 32000,
-                "bitrate": 32000,
+                "bitrate": 64000,
                 "format": "mp3",
                 "channel": 1
             }
