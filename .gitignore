@@ -6,3 +6,14 @@
 
 # OS
 .DS_Store
+.agents/
+
+# Local TTS engine venvs, weights, scratch samples
+.venvs/
+models/
+samples/
+*.wav
+.fastembed_cache/
+
+# Subagent orchestration scratch/artifacts
+.pi-subagents/

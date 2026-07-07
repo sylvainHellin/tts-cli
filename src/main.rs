@@ -10,16 +10,23 @@ use std::process::Command;
 use clap::Parser;
 use serde::Serialize;
 
+mod backend;
+
+use backend::{build_backend, BackendKind, SynthOut};
+
 const API_URL: &str = "https://api.minimax.io/v1/t2a_v2";
-const TEXT_LIMIT: usize = 10000;
+pub(crate) const TEXT_LIMIT: usize = 10000;
 const DEFAULT_PASS_REF: &str = "pass://API Keys and tokens/Minimax/API Key";
+const DEFAULT_VOICE: &str = "English_Upbeat_Woman";
 
 // Exit codes.
 const EXIT_OK: i32 = 0;
 const EXIT_USAGE: i32 = 2;
-const EXIT_API: i32 = 3;
-const EXIT_NETWORK: i32 = 4;
-const EXIT_IO: i32 = 5;
+pub(crate) const EXIT_API: i32 = 3;
+pub(crate) const EXIT_NETWORK: i32 = 4;
+pub(crate) const EXIT_IO: i32 = 5;
+// Local engine / subprocess / ffmpeg failures.
+pub(crate) const EXIT_BACKEND: i32 = 6;
 
 /// Render text to an mp3 via the MiniMax t2a_v2 API.
 //
@@ -31,7 +38,7 @@ const EXIT_IO: i32 = 5;
     about = "Render text to an mp3 via the MiniMax t2a_v2 API.",
     allow_negative_numbers = true
 )]
-struct Cli {
+pub(crate) struct Cli {
     /// Text to speak, or '-' to read stdin.
     text: Option<String>,
 
@@ -39,15 +46,35 @@ struct Cli {
     #[arg(long)]
     file: Option<String>,
 
-    /// mp3 file to write.
+    /// Audio file to write. Format follows --format (mp3 by default).
     #[arg(short = 'o', long)]
     output: String,
+
+    /// Synthesis backend. `minimax` is the cloud default; the others run
+    /// locally on CPU via their own venvs (kokoro fast, chatterbox slow,
+    /// styletts2 ~real-time).
+    #[arg(long, value_enum, default_value_t = BackendKind::Minimax)]
+    backend: BackendKind,
 
     #[arg(long, default_value = "speech-2.8-hd")]
     model: String,
 
-    #[arg(long, default_value = "English_Upbeat_Woman")]
+    /// Voice/voice_id. For MiniMax this is the API voice; for local engines it
+    /// selects the engine's voice/preset. When left at the default, each local
+    /// engine uses its own built-in default voice.
+    #[arg(long, default_value = DEFAULT_VOICE)]
     voice: String,
+
+    /// Reference WAV for voice cloning. Only used by local cloning engines
+    /// (chatterbox, styletts2); ignored by minimax and kokoro.
+    #[arg(long = "ref-audio")]
+    ref_audio: Option<String>,
+
+    /// Measure resource usage (wall/CPU time, peak RAM, threads, iGPU) around a
+    /// local-engine run and write a JSON bench record. No effect on minimax
+    /// beyond a best-effort wall-clock note.
+    #[arg(long)]
+    benchmark: bool,
 
     #[arg(long, default_value_t = 1.0)]
     speed: f64,
@@ -108,6 +135,18 @@ struct Cli {
     dry_run: bool,
 }
 
+impl Cli {
+    /// The voice only if the user set it away from the default, so local engines
+    /// can fall back to their own default voice when unset.
+    pub(crate) fn explicit_voice(&self) -> Option<&str> {
+        if self.voice == DEFAULT_VOICE {
+            None
+        } else {
+            Some(&self.voice)
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct VoiceSetting {
     voice_id: String,
@@ -138,13 +177,13 @@ struct Payload {
 // `Debug` is safe here: this only ever holds an exit code and a human message,
 // never the API key (unlike `Cli`, which deliberately has no `Debug`).
 #[derive(Debug)]
-struct AppError {
-    code: i32,
-    msg: String,
+pub(crate) struct AppError {
+    pub(crate) code: i32,
+    pub(crate) msg: String,
 }
 
 impl AppError {
-    fn new(code: i32, msg: impl Into<String>) -> Self {
+    pub(crate) fn new(code: i32, msg: impl Into<String>) -> Self {
         AppError {
             code,
             msg: msg.into(),
@@ -311,7 +350,7 @@ fn strip_one_quote_pair(s: &str) -> &str {
 /// Resolve the API key: flag, env MINIMAX_API_KEY, --env-file, then pass-cli.
 ///
 /// The key only ever flows into the Authorization header; it is never printed.
-fn resolve_api_key(cli: &Cli) -> Result<String, AppError> {
+pub(crate) fn resolve_api_key(cli: &Cli) -> Result<String, AppError> {
     if let Some(key) = &cli.api_key {
         if !key.is_empty() {
             return Ok(key.clone());
@@ -388,7 +427,7 @@ fn read_input_text(cli: &Cli) -> Result<String, AppError> {
 }
 
 /// Send one chunk to t2a_v2 and return the decoded mp3 bytes.
-fn synthesize_chunk(cli: &Cli, text: &str, api_key: &str) -> Result<Vec<u8>, AppError> {
+pub(crate) fn synthesize_chunk(cli: &Cli, text: &str, api_key: &str) -> Result<Vec<u8>, AppError> {
     let payload = build_payload(cli, text);
     let body = serde_json::to_string(&payload)
         .map_err(|e| AppError::new(EXIT_API, format!("could not encode request: {}", e)))?;
@@ -474,6 +513,12 @@ fn run(cli: &Cli) -> Result<(), AppError> {
     let text = read_input_text(cli)?;
 
     if cli.dry_run {
+        if cli.backend != BackendKind::Minimax {
+            return Err(AppError::new(
+                EXIT_USAGE,
+                "--dry-run only applies to the minimax backend (local engines have no request body to print)",
+            ));
+        }
         // Serialize the struct (not a Value map) so the printed body matches the
         // exact field order sent on the wire; text is elided and no key appears.
         let redacted = format!("<{} chars elided>", count(&text));
@@ -484,36 +529,129 @@ fn run(cli: &Cli) -> Result<(), AppError> {
         return Ok(());
     }
 
-    let api_key = resolve_api_key(cli)?;
+    let backend = build_backend(cli)?;
+    let limit = backend.text_limit();
 
-    let chunks = if count(&text) > TEXT_LIMIT {
+    let chunks = if count(&text) > limit {
         if cli.no_chunk {
             return Err(AppError::new(
                 EXIT_USAGE,
                 format!(
                     "text is {} chars, over the {} limit, and --no-chunk was set.",
                     count(&text),
-                    TEXT_LIMIT
+                    limit
                 ),
             ));
         }
-        split_text(&text, TEXT_LIMIT)
+        split_text(&text, limit)
     } else {
         vec![text]
     };
 
-    let mut audio: Vec<u8> = Vec::new();
+    // MiniMax returns encoded bytes we concatenate directly. Local engines return
+    // a WAV per chunk that we normalize to the output format; with a single chunk
+    // (the common local case) that is one ffmpeg encode straight to --output.
+    let mut byte_audio: Vec<u8> = Vec::new();
+    let mut wav_paths: Vec<std::path::PathBuf> = Vec::new();
+    let mut wav_sample_rate: Option<i64> = None;
     for chunk in &chunks {
-        audio.extend(synthesize_chunk(cli, chunk, &api_key)?);
+        match backend.synthesize(chunk)? {
+            SynthOut::Bytes(b) => byte_audio.extend(b),
+            SynthOut::Wav {
+                path, sample_rate, ..
+            } => {
+                wav_paths.push(path);
+                // All chunks from one engine share a sample rate; keep the last.
+                wav_sample_rate = Some(sample_rate);
+            }
+        }
     }
 
-    std::fs::write(&cli.output, &audio)
-        .map_err(|e| AppError::new(EXIT_IO, format!("cannot write {}: {}", cli.output, e)))?;
+    if !wav_paths.is_empty() {
+        normalize_wavs_to_output(cli, &wav_paths, wav_sample_rate)?;
+    } else {
+        std::fs::write(&cli.output, &byte_audio)
+            .map_err(|e| AppError::new(EXIT_IO, format!("cannot write {}: {}", cli.output, e)))?;
+    }
 
     let abs = std::fs::canonicalize(&cli.output)
         .unwrap_or_else(|_| std::path::PathBuf::from(&cli.output));
     println!("{}", abs.display());
     Ok(())
+}
+
+/// Normalize local-engine WAV(s) to the requested `--output` via ffmpeg.
+///
+/// A single WAV to a `.wav` output is a plain copy (no re-encode) *only when no
+/// resample/remix is needed* — i.e. the requested `--sample-rate` matches the
+/// engine's emitted rate and `--channel` is 1 (engines emit mono). Otherwise, and
+/// for any non-wav output, the WAV(s) are (concatenated and) encoded to the output
+/// container honoring the `--sample-rate`/`--channel`/`--bitrate` knobs.
+fn normalize_wavs_to_output(
+    cli: &Cli,
+    wavs: &[std::path::PathBuf],
+    engine_sample_rate: Option<i64>,
+) -> Result<(), AppError> {
+    let out_is_wav = std::path::Path::new(&cli.output)
+        .extension()
+        .map(|e| e.eq_ignore_ascii_case("wav"))
+        .unwrap_or(false);
+
+    // Plain copy only when the container is wav AND no resample/remix is requested:
+    // requested rate equals the engine's native rate and mono is requested. This
+    // keeps `.wav` output from silently ignoring `--sample-rate`/`--channel`.
+    let no_resample_remix = engine_sample_rate == Some(cli.sample_rate) && cli.channel == 1;
+    if wavs.len() == 1 && out_is_wav && no_resample_remix {
+        std::fs::copy(&wavs[0], &cli.output).map_err(|e| {
+            AppError::new(EXIT_IO, format!("cannot write {}: {}", cli.output, e))
+        })?;
+        return Ok(());
+    }
+
+    ensure_ffmpeg()?;
+
+    // Build: ffmpeg -y -hide_banner -loglevel error [-i wav]... [-filter_complex concat] \
+    //        -ar SR -ac CH [-b:a BR] OUTPUT
+    let mut cmd = Command::new("ffmpeg");
+    cmd.arg("-y").arg("-hide_banner").arg("-loglevel").arg("error");
+    for w in wavs {
+        cmd.arg("-i").arg(w);
+    }
+    if wavs.len() > 1 {
+        let inputs: String = (0..wavs.len()).map(|i| format!("[{}:a]", i)).collect();
+        let filter = format!("{}concat=n={}:v=0:a=1[out]", inputs, wavs.len());
+        cmd.arg("-filter_complex").arg(filter).arg("-map").arg("[out]");
+    }
+    cmd.arg("-ar").arg(cli.sample_rate.to_string());
+    cmd.arg("-ac").arg(cli.channel.to_string());
+    if !out_is_wav {
+        // Bitrate applies to lossy containers; harmless to omit for wav.
+        cmd.arg("-b:a").arg(cli.bitrate.to_string());
+    }
+    cmd.arg(&cli.output);
+
+    let output = cmd
+        .output()
+        .map_err(|e| AppError::new(EXIT_BACKEND, format!("failed to launch ffmpeg: {}", e)))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(AppError::new(
+            EXIT_BACKEND,
+            format!("ffmpeg failed ({}): {}", output.status, stderr.trim()),
+        ));
+    }
+    Ok(())
+}
+
+/// Error clearly if ffmpeg is not on PATH.
+fn ensure_ffmpeg() -> Result<(), AppError> {
+    match Command::new("ffmpeg").arg("-version").output() {
+        Ok(o) if o.status.success() => Ok(()),
+        _ => Err(AppError::new(
+            EXIT_BACKEND,
+            "ffmpeg not found on PATH; it is required to encode local-engine audio",
+        )),
+    }
 }
 
 fn main() {
@@ -533,6 +671,40 @@ mod tests {
 
     fn cli_from(args: &[&str]) -> Cli {
         Cli::try_parse_from(args).expect("args parse")
+    }
+
+    #[test]
+    fn backend_defaults_to_minimax() {
+        let cli = cli_from(&["tts", "-o", "/tmp/x.mp3", "hi"]);
+        assert_eq!(cli.backend, BackendKind::Minimax);
+        assert!(!cli.benchmark);
+        assert!(cli.ref_audio.is_none());
+    }
+
+    #[test]
+    fn backend_flag_parses_all_variants() {
+        for (name, want) in [
+            ("minimax", BackendKind::Minimax),
+            ("kokoro", BackendKind::Kokoro),
+            ("chatterbox", BackendKind::Chatterbox),
+            ("styletts2", BackendKind::Styletts2),
+        ] {
+            let cli = cli_from(&["tts", "-o", "/tmp/x.mp3", "--backend", name, "hi"]);
+            assert_eq!(cli.backend, want, "backend {}", name);
+        }
+    }
+
+    #[test]
+    fn backend_flag_rejects_unknown() {
+        assert!(Cli::try_parse_from(["tts", "-o", "/tmp/x.mp3", "--backend", "nope", "hi"]).is_err());
+    }
+
+    #[test]
+    fn explicit_voice_only_when_overridden() {
+        let dflt = cli_from(&["tts", "-o", "/tmp/x.mp3", "hi"]);
+        assert_eq!(dflt.explicit_voice(), None);
+        let set = cli_from(&["tts", "-o", "/tmp/x.mp3", "--voice", "af_bella", "hi"]);
+        assert_eq!(set.explicit_voice(), Some("af_bella"));
     }
 
     #[test]

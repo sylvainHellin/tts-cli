@@ -1,7 +1,14 @@
 # tts-cli
 
-A thin, transparent CLI wrapper around the MiniMax `t2a_v2` text-to-speech API.
-It renders text to an mp3 file and prints the output path. Nothing more.
+A thin, transparent CLI wrapper around the MiniMax `t2a_v2` text-to-speech API,
+with optional **local CPU backends** (Kokoro, StyleTTS2, Chatterbox) for offline,
+token-free synthesis. It renders text to an audio file and prints the output path.
+Nothing more.
+
+MiniMax remains the default. The local backends exist so long-form audio (books,
+papers) can be rendered on the home server without spending cloud tokens; see
+[BENCHMARKS.md](BENCHMARKS.md) for a full size-vs-latency-vs-quality comparison
+measured on that CPU-only box.
 
 Written in Rust. The HTTP client is rustls-based (via `ureq`), so the binary
 builds and runs on a headless Linux box with no OpenSSL system library. The
@@ -42,6 +49,15 @@ echo "piped text" | tts -o /tmp/piped.mp3 -
 # inspect the request without spending an API call
 tts --dry-run -o /tmp/x.mp3 "hello world"
 
+# render locally on CPU with no cloud call (Kokoro is the fast local default)
+tts --backend kokoro -o /tmp/local.mp3 "Hello from a local model."
+
+# local voice cloning from a reference clip (chatterbox or styletts2)
+tts --backend styletts2 --ref-audio ref.wav -o /tmp/cloned.mp3 "Cloned voice."
+
+# measure how intensive a render is (CPU/wall time, peak RAM, threads, iGPU)
+tts --backend kokoro --benchmark -o /tmp/x.mp3 --file paper.txt
+
 # headless / cron: read MINIMAX_API_KEY from a dotenv file, no shell needed
 tts --env-file /home/sylvain/.hermes/.env --file script.txt -o /tmp/out.mp3
 ```
@@ -54,6 +70,9 @@ nonzero exit codes: 2 usage, 3 API error, 4 network error, 5 IO/write error.
 
 | Flag | Default |
 | --- | --- |
+| `--backend` | `minimax` (also: `kokoro`, `styletts2`, `chatterbox`) |
+| `--ref-audio` | unset (reference WAV for cloning; local cloning engines only) |
+| `--benchmark` | off (write a JSON resource-usage record around the run) |
 | `--model` | `speech-2.8-hd` |
 | `--voice` | `English_Upbeat_Woman` |
 | `--speed` | `1.0` |
@@ -68,7 +87,52 @@ nonzero exit codes: 2 usage, 3 API error, 4 network error, 5 IO/write error.
 
 `--no-chunk` errors instead of chunking when text is over the limit.
 `--dry-run` (alias `--print-payload`) prints the request body with the text
-elided to a char count and no key present, and sends nothing.
+elided to a char count and no key present, and sends nothing. `--dry-run` applies
+to the `minimax` backend only (local engines have no request body to print).
+
+## Backends
+
+`--backend` selects the synthesis engine. `minimax` is the cloud default and is
+unchanged; the rest run **locally on CPU** (no cloud call, no tokens spent):
+
+| Backend | Where | Speed on this box | Cloning | When to use |
+| --- | --- | --- | --- | --- |
+| `minimax` | cloud (paid) | instant (network) | no | top quality, don't mind the paid/cloud path |
+| `kokoro` | local CPU | ~4× faster than real time | no | **fast local default** for books/papers |
+| `styletts2` | local CPU | ~real time | yes (`--ref-audio`) | cloned/expressive voice near real time |
+| `chatterbox` | local CPU | ~7× slower than real time | yes (`--ref-audio`) | max expressiveness / cloning, offline batch (verbatim, but slow + RAM-hungry) |
+
+Chatterbox reads **verbatim**; its shorter renders reflect a faster speaking cadence,
+not dropped text. Its real cost is speed and memory (~7× slower than real time, ~6.7 GB
+RAM peak), so use it offline/batch. On a subjective listen the local voices sit a clear
+step below MiniMax, and among them **Kokoro sounded best overall despite being the
+smallest**. See [BENCHMARKS.md](BENCHMARKS.md) for the numbers behind this table.
+
+### Local engine setup
+
+Each local backend runs from its **own [uv](https://docs.astral.sh/uv/)-managed
+virtualenv** under `.venvs/<name>` (isolated so heavy PyTorch stacks never collide
+with each other or the system Python), with weights under `models/` or the Hugging
+Face cache. Weights download once on first run, then everything runs offline. The
+uniform script contract every engine implements is documented in
+[`engines/CONTRACT.md`](engines/CONTRACT.md).
+
+**Performance is CPU-bound.** The home server (Ryzen 7 PRO 8845HS, Radeon 780M
+iGPU only, no CUDA/ROCm) runs all local engines on the CPU — the iGPU stays idle
+(measured 0%). Expect Kokoro to be effortless, StyleTTS2 to be roughly real time,
+and Chatterbox to be slow and RAM-hungry (~6.7 GB peak). See
+[BENCHMARKS.md](BENCHMARKS.md).
+
+### `--benchmark`
+
+Wraps a run and writes a JSON resource-usage record (default `samples/bench/`) with
+wall/CPU time, peak RSS, peak thread count, iGPU busy %, real-time factor, and
+derived compute-seconds-per-minute-of-audio and CPU-seconds-per-1000-words figures.
+Use it to estimate how heavy a full book will be before committing to a run.
+
+```bash
+tts --backend <minimax|kokoro|chatterbox|styletts2> --benchmark -o out.mp3 --file <text>
+```
 
 ## API key resolution
 

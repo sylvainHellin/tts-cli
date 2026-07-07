@@ -22,6 +22,27 @@ the 10000-char limit on its own. Defaults (model `speech-2.8-hd`, voice
 `English_Upbeat_Woman`) match the daily briefing voice, so override only when
 asked. Full flags in `tts --help` and the repo README.
 
+## Backends (cloud vs local CPU)
+
+`--backend` picks the engine. `minimax` (default) is the cloud/paid path and top
+quality. Three local backends run **offline on CPU** with no tokens spent — use
+these for long books/papers to avoid cloud cost:
+
+- `kokoro` — fast local default (~4× faster than real time), natural, no cloning.
+  Reach for this for local narration and audiobooks; on a subjective listen it sounded
+  the best of the local engines despite being the smallest.
+- `styletts2` — ~real time, more expressive, supports voice cloning (`--ref-audio`).
+- `chatterbox` — most expressive + cloning and reads **verbatim** (its shorter renders are
+  a faster speaking cadence, not dropped text); the cost is ~7× slower than real time and
+  RAM-hungry (~6.7 GB peak), so use it offline/batch. Local voices overall sit a step below
+  MiniMax quality.
+
+Local engines run from their own uv venvs (`.venvs/<name>`); weights download once,
+then run offline. On the home server everything is CPU-only (no CUDA/ROCm), so the
+iGPU is idle and speed is CPU-bound. `--benchmark` writes a JSON resource record
+(wall/CPU time, peak RAM, real-time factor) to gauge how heavy a render will be.
+See `BENCHMARKS.md` in the repo for the full tradeoff table.
+
 The API key resolves in order: `--api-key`, then env `MINIMAX_API_KEY`, then
 `--env-file <PATH>` (read `MINIMAX_API_KEY` from a dotenv file), then Proton Pass
 via `pass-cli` (ref `pass://API Keys and tokens/Minimax/API Key`, override with
