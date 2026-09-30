@@ -46,10 +46,9 @@ See `BENCHMARKS.md` in the repo for the full tradeoff table.
 The API key resolves in order: `--api-key`, then env `MINIMAX_API_KEY`, then
 `--env-file <PATH>` (read `MINIMAX_API_KEY` from a dotenv file), then Proton Pass
 via `pass-cli` (ref `pass://API Keys and tokens/Minimax/API Key`, override with
-`--pass-ref`). For cron/gateway use, pass `--env-file /home/sylvain/.hermes/.env`:
-that environment does not export the key and `approvals.cron_mode: deny` blocks
-`bash -lc`, so a single direct call with `--env-file` (no shell) is the only path
-that works there. `pass-cli` is the route for interactive and Mac use. If no
+`--pass-ref`). For cron or any headless runner that neither exports the key nor
+reaches `pass-cli`, pass `--env-file /home/sylvain/.config/environment.d/minimax.conf`:
+a single direct call with no shell. `pass-cli` is the route for interactive and Mac use. If no
 source yields a key the CLI exits nonzero naming both; surface that, do not retry
 blindly. The key is never printed.
 

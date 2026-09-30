@@ -59,7 +59,7 @@ tts --backend styletts2 --ref-audio ref.wav -o /tmp/cloned.mp3 "Cloned voice."
 tts --backend kokoro --benchmark -o /tmp/x.mp3 --file paper.txt
 
 # headless / cron: read MINIMAX_API_KEY from a dotenv file, no shell needed
-tts --env-file /home/sylvain/.hermes/.env --file script.txt -o /tmp/out.mp3
+tts --env-file /home/sylvain/.config/environment.d/minimax.conf --file script.txt -o /tmp/out.mp3
 ```
 
 On success the absolute output path is printed to stdout and the exit code is 0,
@@ -154,15 +154,14 @@ header. It is never printed (not in errors, not in `--dry-run`, not in logs).
    current environment (including `PROTON_PASS_KEY_PROVIDER`, which differs per
    machine and is not set by `tts`).
 
-Env-first is deliberate, but cron is the special case. The `hermes` cron/gateway
-environment does not export `MINIMAX_API_KEY` to spawned commands and cannot
-reach `pass-cli`, and it runs with `approvals.cron_mode: deny`, which blocks any
-`bash -lc '...'` command. So a cron job cannot grep the key out of a dotenv file
-with a shell. `--env-file` solves this: it makes the whole thing a single direct
-binary call with no shell, which the approval layer does not flag:
+Env-first is deliberate, but a scheduler is the special case. A cron job or a
+headless runner often neither exports `MINIMAX_API_KEY` nor reaches `pass-cli`,
+and may refuse `bash -lc '...'` wrappers, so it cannot grep the key out of a
+dotenv file with a shell. `--env-file` makes the whole thing a single direct
+binary call with no shell:
 
 ```bash
-tts --env-file /home/sylvain/.hermes/.env --file script.txt -o out.mp3
+tts --env-file /home/sylvain/.config/environment.d/minimax.conf --file script.txt -o out.mp3
 ```
 
 The `pass-cli` path is the convenient route for interactive and Mac use, where

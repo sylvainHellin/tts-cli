@@ -113,7 +113,7 @@ pub(crate) struct Cli {
 
     /// Read MINIMAX_API_KEY from this dotenv file when no higher-priority key is
     /// set. Lets cron call the binary directly, with no shell, to pick up the
-    /// key (e.g. --env-file /home/sylvain/.hermes/.env). Only MINIMAX_API_KEY is
+    /// key (e.g. --env-file ~/.config/environment.d/minimax.conf). Only MINIMAX_API_KEY is
     /// read; nothing else is imported into the environment.
     #[arg(long = "env-file")]
     env_file: Option<String>,
@@ -362,8 +362,8 @@ pub(crate) fn resolve_api_key(cli: &Cli) -> Result<String, AppError> {
         }
     }
 
-    // Dotenv file (e.g. ~/.hermes/.env). Lets the cron call us without a shell
-    // to grep the key out, which `approvals.cron_mode: deny` would block.
+    // Dotenv file (e.g. ~/.config/environment.d/minimax.conf). Lets a cron job
+    // call us directly, without a shell to grep the key out.
     if let Some(path) = &cli.env_file {
         if let Some(key) = key_from_env_file(path)? {
             return Ok(key);
